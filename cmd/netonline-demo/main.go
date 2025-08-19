@@ -23,12 +23,21 @@ func main() {
 	wakeSample := flag.Duration("wake-sample", time.Second, "wake detector sampling period")
 	wakeGap := flag.Duration("wake-gap", 1500*time.Millisecond, "gap threshold to classify as wake")
 	flag.Parse()
-	fmt.Printf("validate=%v, timeout=%s, require=%d, wake-sample=%s, wake-gap=%s\n", *validate, timeout, require, wakeSample, wakeGap)
+
+	// (kept as-is; prints pointer addresses for non-dereferenced values)
+	fmt.Printf("validate=%v, timeout=%s, require=%d, wake-sample=%s, wake-gap=%s\n",
+		*validate, timeout, require, wakeSample, wakeGap)
+
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	events, errs := netonline.Watch(ctx)
 	wakes := netonline.StartWakeGapWatcher(ctx, *wakeSample, *wakeGap)
+
+	// Make local aliases so we can nil-out closed channels and remove cases from select.
+	eventsCh := events
+	errsCh := errs
+	wakesCh := wakes
 
 	logEvent := func(ts time.Time, online bool, cause string, validated *bool, why string) {
 		if validated == nil {
@@ -39,24 +48,43 @@ func main() {
 	}
 
 	for {
+		// Exit once all sources are done.
+		if eventsCh == nil && errsCh == nil && wakesCh == nil {
+			return
+		}
+
 		select {
-		case ev := <-events:
+		case ev, ok := <-eventsCh:
+			if !ok {
+				eventsCh = nil
+				continue
+			}
 			if ev.Online && *validate {
-				ok, why := connectivityCheck(ctx, *timeout, *require)
-				logEvent(ev.ChangedAt, ev.Online, ev.Cause, &ok, why)
+				okv, why := connectivityCheck(ctx, *timeout, *require)
+				logEvent(ev.ChangedAt, ev.Online, ev.Cause, &okv, why)
 			} else {
 				logEvent(ev.ChangedAt, ev.Online, ev.Cause, nil, "")
 			}
-		case <-wakes:
+
+		case _, ok := <-wakesCh:
+			if !ok {
+				wakesCh = nil
+				continue
+			}
 			online, cause, _ := netonline.Evaluate()
 			ts := time.Now()
 			if online && *validate {
-				ok, why := connectivityCheck(ctx, *timeout, *require)
-				logEvent(ts, online, "wake; "+cause, &ok, why)
+				okv, why := connectivityCheck(ctx, *timeout, *require)
+				logEvent(ts, online, "wake; "+cause, &okv, why)
 			} else {
 				logEvent(ts, online, "wake; "+cause, nil, "")
 			}
-		case err := <-errs:
+
+		case err, ok := <-errsCh:
+			if !ok {
+				errsCh = nil
+				continue
+			}
 			if err != nil {
 				fmt.Println("error:", err)
 			}
@@ -90,7 +118,6 @@ func connectivityCheck(parent context.Context, timeout time.Duration, require in
 	ok := 0
 	for i := 0; i < len(probes); i++ {
 		select {
-
 		case <-ctx.Done():
 			if ok >= require {
 				return true, "ok (timeout after quorum)"
